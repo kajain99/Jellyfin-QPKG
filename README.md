@@ -29,6 +29,8 @@ Since this QPKG is unsigned, you need to allow the installation of unsigned appl
 1. Download the Jellyfin QPKG from [this repository's Releases section](https://github.com/kajain99/Jellyfin-qpkg/releases).
 2. In the App Center, click **Install Manually**.
 3. Select the downloaded QPKG file and follow the on-screen instructions.
+   ![allow unsigned applications](https://www.thestorageguy.net/content/images/2025/01/image.png)
+
 
 ### Step 3: Initial Run
 
