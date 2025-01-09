@@ -41,6 +41,7 @@ Since this QPKG is unsigned, you need to allow the installation of unsigned appl
     (Replace `<your-qnap-ip>` with your QNAP’s IP address, e.g., `192.168.1.100`.)
   - Follow the on-screen steps to complete the initial setup, including setting your username and password.
     ![if you see this screen you need to run the first time setup wizard ](https://www.thestorageguy.net/content/images/2025/01/image-1.png)
+![first time setup screen ](https://www.thestorageguy.net/content/images/2025/01/image-2.png)
 
 
 ---
