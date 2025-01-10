@@ -73,7 +73,7 @@ fi
     fi
 
     # Create the container with parsed mounts and capture output
-    DOCKER_OUTPUT=$($DOCKER_PATH create --name jellyfin -p 8096:8096 -v "$CONFIG_DIR:/config" $MOUNT_ARGS jellyfin/jellyfin:latest 2>&1)
+    DOCKER_OUTPUT=$($DOCKER_PATH create --name jellyfin -p 8096:8096 -v "$CONFIG_DIR:/config" $MOUNT_ARGS jellyfin/jellyfin:10.8.10 2>&1)
     DOCKER_EXIT_CODE=$?
 
     if [ $DOCKER_EXIT_CODE -eq 0 ]; then
