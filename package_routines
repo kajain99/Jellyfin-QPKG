@@ -1,0 +1,312 @@
+#!/bin/bash
+
+# Unified logging functions
+log() {
+    local MESSAGE="$(date '+%Y-%m-%d %H:%M:%S') [INFO] $*"
+    echo "$MESSAGE"
+    /sbin/log_tool -t0 -uSystem -p127.0.0.1 -mlocalhost -a "$MESSAGE"
+}
+warn_log() {
+    local MESSAGE="$(date '+%Y-%m-%d %H:%M:%S') [WARN] $*"
+    echo "$MESSAGE"
+    /sbin/log_tool -t1 -uSystem -p127.0.0.1 -mlocalhost -a "$MESSAGE"
+}
+err_log() {
+    local MESSAGE="$(date '+%Y-%m-%d %H:%M:%S') [ERROR] $*"
+    echo "$MESSAGE"
+    /sbin/log_tool -t2 -uSystem -p127.0.0.1 -mlocalhost -a "$MESSAGE"
+    exit 1
+}
+
+#debug log to see if this is run properly
+#log "Script invoked with argument: $1"
+
+# Helper functions
+
+# Function to parse mounts from the all_mounts file and construct mount arguments
+parse_mounts() {
+    local MOUNT_FILE="$1"
+    local MOUNT_ARGS=""
+
+    if [ -f "$MOUNT_FILE" ]; then
+        while IFS= read -r LINE; do
+            # Ensure the line is not empty and starts with '-v'
+            if [[ $LINE == -v* ]]; then
+                MOUNT_ARGS+=" $LINE"
+            fi
+        done < "$MOUNT_FILE"
+    else
+        err_log "Mount file not found: $MOUNT_FILE"
+        return 1
+    fi
+
+    echo "$MOUNT_ARGS"
+}
+
+# Main function to create the Docker container
+create_jellyfin_container() {
+    create_all_mounts_file  # Ensure the all_mounts file is created
+    
+    log "Checking if Jellyfin container already exists..."
+if $DOCKER_PATH inspect --type container jellyfin >/dev/null 2>&1; then
+    warn_log "Jellyfin container already exists. Verifying its state..."
+
+    # Check if the container is in an exited state and remove it if necessary
+    if $DOCKER_PATH ps -a --filter "name=jellyfin" --filter "status=exited" | awk '{print $NF}' | grep -qx "jellyfin"; then
+        log "Found an exited Jellyfin container. Removing it to recreate."
+        $DOCKER_PATH rm -f jellyfin || err_log "Failed to remove exited Jellyfin container."
+    else
+        log "Jellyfin container is already active. Skipping creation."
+        return 0
+    fi
+fi
+
+
+    log "Creating the Jellyfin container with mounts..."
+
+    # Parse mounts from the all_mounts file
+    MOUNT_FILE="${CONFIG_DIR}/all_mounts"
+    MOUNT_ARGS=$(parse_mounts "$MOUNT_FILE")
+    if [ $? -ne 0 ]; then
+        err_log "Failed to parse mounts from $MOUNT_FILE"
+        return 1
+    fi
+
+    # Create the container with parsed mounts and capture output
+    DOCKER_OUTPUT=$($DOCKER_PATH create --name jellyfin -p 8096:8096 -v "$CONFIG_DIR:/config" $MOUNT_ARGS jellyfin/jellyfin:10.8.10 2>&1)
+    DOCKER_EXIT_CODE=$?
+
+    if [ $DOCKER_EXIT_CODE -eq 0 ]; then
+        log "Jellyfin container created successfully."
+        log "Docker output: $DOCKER_OUTPUT"
+    else
+        err_log "Failed to create Jellyfin container. Docker output: $DOCKER_OUTPUT"
+        return 1
+    fi
+}
+
+
+
+
+
+create_all_mounts_file() {
+    log "Creating all_mounts file in the config directory with /mnt/<share_name> paths..."
+
+    # Detect primary volume and QPKG path
+    detect_primary_volume
+    resolve_qpkg_path
+
+    # Path to the smb.conf file and all_mounts file
+    SMB_CONF="/etc/config/smb.conf"
+    ALL_MOUNTS_FILE="${CONFIG_DIR}/all_mounts"
+
+    # Verify smb.conf existence
+    if [ ! -f "$SMB_CONF" ]; then
+        err_log "Shared folders configuration file not found: $SMB_CONF"
+        return 1
+    fi
+
+    # Ensure the config directory exists
+    if [ ! -d "$CONFIG_DIR" ]; then
+        mkdir -p "$CONFIG_DIR" || err_log "Failed to create config directory: $CONFIG_DIR"
+    fi
+
+    # Start fresh
+    > "$ALL_MOUNTS_FILE"
+
+    # Parse smb.conf for shared folder paths
+    grep "^\[" "$SMB_CONF" | sed 's/\[\(.*\)\]/\1/' | while read -r SHARE_NAME; do
+        SHARE_PATH=$(/sbin/getcfg "$SHARE_NAME" path -f "$SMB_CONF")
+        if [ -n "$SHARE_PATH" ] && [ -d "$SHARE_PATH" ]; then
+            if [ -w "$SHARE_PATH" ]; then
+                CONTAINER_PATH="/mnt/${SHARE_NAME}"  # Mount under /mnt/<share_name> in the container
+                echo "-v ${SHARE_PATH}:${CONTAINER_PATH}:rw" >> "$ALL_MOUNTS_FILE"
+                log "Added mount: ${SHARE_PATH} -> ${CONTAINER_PATH} (RW access)"
+            else
+                warn_log "Skipping share without RW access: $SHARE_NAME ($SHARE_PATH)"
+            fi
+        else
+            warn_log "Skipping invalid or missing share: $SHARE_NAME ($SHARE_PATH)"
+        fi
+    done
+
+    log "All mounts written to: $ALL_MOUNTS_FILE"
+}
+
+
+
+detect_primary_volume() {
+    PRIMARY_VOLUME=$(getcfg SHARE_DEF defVolMP -d "" -f /etc/config/def_share.info)
+    if [ -z "$PRIMARY_VOLUME" ]; then
+        err_log "Primary volume not found. Exiting."
+    fi
+    log "Detected primary volume: $PRIMARY_VOLUME"
+}
+
+resolve_qpkg_path() {
+    QPKG_DIR="${PRIMARY_VOLUME}/.qpkg"
+    if [ -L "$QPKG_DIR" ]; then
+        QPKG_DIR=$(readlink -f "$QPKG_DIR") || err_log "Failed to resolve symbolic link for .qpkg directory."
+    fi
+    QPKG_PATH="${QPKG_DIR}/Jellyfin"
+    CONFIG_DIR="${QPKG_PATH}/config"
+    log "Resolved QPKG path to: $QPKG_PATH"
+}
+
+verify_container_station() {
+    if [ ! -d "${PRIMARY_VOLUME}/.qpkg/container-station" ]; then
+        err_log "Container Station is not installed. Please install it first."
+    fi
+}
+
+detect_docker_binary() {
+    CONTAINER_STATION_DIR=$(/sbin/getcfg container-station Install_Path -f /etc/config/qpkg.conf)
+    DOCKER_PATH="$CONTAINER_STATION_DIR/bin/docker"
+    if [ -z "$DOCKER_PATH" ] || [ ! -x "$DOCKER_PATH" ]; then
+        err_log "Docker binary not found or is not executable. Ensure Container Station is installed and accessible."
+    fi
+    export PATH="$(dirname "$DOCKER_PATH"):$PATH"
+    log "Docker binary detected and PATH updated: $PATH"
+}
+
+prepare_directories() {
+    mkdir -p "$QPKG_PATH" "$CONFIG_DIR" || err_log "Failed to create necessary directories at $QPKG_PATH or $CONFIG_DIR."
+    log "Directories prepared successfully."
+}
+
+# Core functions
+pkg_pre_install() {
+    log "Running pre-installation steps..."
+}
+
+pkg_install() {
+    log "Starting Jellyfin installation..."
+    detect_primary_volume
+    resolve_qpkg_path
+    verify_container_station
+    detect_docker_binary
+    prepare_directories
+
+    # Copy package_routines
+    local PACKAGE_ROUTINES_SRC="$(dirname "$0")/package_routines"
+    if [ ! -f "$PACKAGE_ROUTINES_SRC" ]; then
+        err_log "package_routines not found in $(dirname "$0")."
+    fi
+    cp "$PACKAGE_ROUTINES_SRC" "$QPKG_PATH" || err_log "Failed to copy package_routines to $QPKG_PATH."
+    log "package_routines copied successfully."
+
+    # Pull Docker image
+    log "Pulling Jellyfin Docker image from Docker Hub..."
+    if ! $DOCKER_PATH pull jellyfin/jellyfin:10.8.10; then
+	
+
+        err_log "Failed to pull Jellyfin Docker image."
+    fi
+    log "Docker image pulled successfully."
+
+    # Create or reuse the container
+    create_jellyfin_container
+
+    # Verify and start the container
+    log "Verifying container creation..."
+    pkg_start
+}
+
+
+pkg_start() {
+    log "Starting Jellyfin..."
+    detect_docker_binary
+    prepare_mounts
+
+    # Exact name match for Jellyfin container
+    if $DOCKER_PATH inspect --type container jellyfin >/dev/null 2>&1; then
+        $DOCKER_PATH start jellyfin || err_log "Failed to start Jellyfin container."
+        log "Jellyfin container started successfully."
+    else
+        err_log "Jellyfin container not found. Please install it first."
+    fi
+}
+
+
+
+pkg_post_install() {
+    log "Running post-installation steps for Jellyfin..."
+	resolve_qpkg_path
+    /sbin/setcfg "$QPKG_NAME" depend_on "container-station" -f /etc/config/qpkg.conf
+    /sbin/setcfg "$QPKG_NAME" Timeout "120,60" -f /etc/config/qpkg.conf
+    /sbin/setcfg "$QPKG_NAME" Enable TRUE -f /etc/config/qpkg.conf
+	
+
+    log "Post-installation steps completed successfully."
+}
+
+
+
+
+pkg_stop() {
+    log "Stopping Jellyfin..."
+    detect_docker_binary
+    if $DOCKER_PATH ps --filter "name=jellyfin" | grep -q jellyfin; then
+        $DOCKER_PATH stop jellyfin || err_log "Failed to stop Jellyfin container."
+    else
+        warn_log "Jellyfin container not running."
+    fi
+    log "Jellyfin container stopped successfully."
+}
+
+# Dynamically resolve QPKG path and Docker binary
+PKG_MAIN_REMOVE="{
+    QPKG_PATH=\$(/sbin/getcfg Jellyfin Install_Path -d '' -f /etc/config/qpkg.conf)
+    DOCKER_PATH=\$(/sbin/getcfg container-station Install_Path -d '' -f /etc/config/qpkg.conf)/bin/docker
+
+    if [ -z \"\$QPKG_PATH\" ]; then
+        echo '[ERROR] Failed to resolve QPKG_PATH. Exiting.' >&2
+        exit 1
+    fi
+    if [ -z \"\$DOCKER_PATH\" ] || [ ! -x \"\$DOCKER_PATH\" ]; then
+        echo '[ERROR] Docker binary not found or not executable. Exiting.' >&2
+        exit 1
+    fi
+
+    echo '[INFO] Stopping Jellyfin container...'
+    \$DOCKER_PATH stop jellyfin || echo '[WARN] Failed to stop Jellyfin container.'
+
+    echo '[INFO] Removing Jellyfin container...'
+    \$DOCKER_PATH rm -f jellyfin || echo '[WARN] Failed to remove Jellyfin container.'
+
+    echo '[INFO] Removing QPKG directory at \$QPKG_PATH...'
+    rm -rf \$QPKG_PATH || echo '[WARN] Failed to remove QPKG directory.'
+
+    echo '[INFO] Jellyfin QPKG removed successfully.'
+}"
+
+PKG_POST_REMOVE="{
+    echo '[INFO] Performing post-removal cleanup...'
+    # Add additional cleanup tasks here if necessary
+    echo '[INFO] Post-removal cleanup completed.'
+}"
+
+PKG_PRE_REMOVE="{
+    QPKG_PATH=\$(/sbin/getcfg Jellyfin Install_Path -d '' -f /etc/config/qpkg.conf)
+    DOCKER_PATH=\$(/sbin/getcfg container-station Install_Path -d '' -f /etc/config/qpkg.conf)/bin/docker
+
+    if [ -z \"\$DOCKER_PATH\" ] || [ ! -x \"\$DOCKER_PATH\" ]; then
+        echo '[ERROR] Docker binary not found. Exiting.' >&2
+        exit 1
+    fi
+    echo '[INFO] Stopping Jellyfin container before removal...'
+    \$DOCKER_PATH stop jellyfin || echo '[WARN] Container already stopped or not running.'
+}"
+
+# Main entry point
+if [ -z "$1" ]; then
+    log "No argument provided. Defaulting to 'install'."
+    set -- install
+fi
+
+case "$1" in
+    install) pkg_install ;;
+    start) pkg_start ;;
+    stop) pkg_stop ;;
+    *) err_log "Invalid action: $1. Use install, start, or stop." ;;
+esac
