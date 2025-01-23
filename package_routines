@@ -121,7 +121,9 @@ create_all_mounts_file() {
         SHARE_PATH=$(/sbin/getcfg "$SHARE_NAME" path -f "$SMB_CONF")
         if [ -n "$SHARE_PATH" ] && [ -d "$SHARE_PATH" ]; then
             if [ -w "$SHARE_PATH" ]; then
-                CONTAINER_PATH="/mnt/${SHARE_NAME}"  # Mount under /mnt/<share_name> in the container
+		LOWERCASE_NAME=$(echo "$SHARE_NAME" | tr '[:upper:]' '[:lower:]')
+                CONTAINER_PATH="/mnt/${LOWERCASE_NAME}"  # Mount in lowercase now 
+                #CONTAINER_PATH="/mnt/${SHARE_NAME}"  # Mount under /mnt/<share_name> in the container
                 echo "-v ${SHARE_PATH}:${CONTAINER_PATH}:rw" >> "$ALL_MOUNTS_FILE"
                 log "Added mount: ${SHARE_PATH} -> ${CONTAINER_PATH} (RW access)"
             else
