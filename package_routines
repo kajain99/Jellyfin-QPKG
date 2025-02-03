@@ -22,127 +22,16 @@ err_log() {
     exit 1
 }
 
-# Helper functions
-
-# Function to parse mounts from the all_mounts file and construct mount arguments
-
 no_op() {
     log "No operation specified. Running a placeholder function."
 }
 
-
-parse_mounts() {
-    local MOUNT_FILE="$1"
-    local MOUNT_ARGS=""
-
-    if [ -f "$MOUNT_FILE" ]; then
-        while IFS= read -r LINE; do
-            # Ensure the line is not empty and starts with '-v'
-            if [[ $LINE == -v* ]]; then
-                MOUNT_ARGS+=" $LINE"
-            fi
-        done < "$MOUNT_FILE"
-    else
-        err_log "Mount file not found: $MOUNT_FILE"
-        return 1
-    fi
-
-    echo "$MOUNT_ARGS"
-}
-
-# Main function to create the Docker container
-create_container() {
-    create_all_mounts_file  # Ensure the all_mounts file is created
-    
-    log "Checking if ${PACKAGE_NAME} container already exists..."
-if $DOCKER_PATH inspect --type container ${PACKAGE_NAME} >/dev/null 2>&1; then
-    warn_log "${PACKAGE_NAME} container already exists. Verifying its state..."
-
-    # Check if the container is in an exited state and remove it if necessary
-    if $DOCKER_PATH ps -a --filter "name=${PACKAGE_NAME}" --filter "status=exited" | awk '{print $NF}' | grep -qx "${PACKAGE_NAME}"; then
-        log "Found an exited ${PACKAGE_NAME} container. Removing it to recreate."
-        $DOCKER_PATH rm -f ${PACKAGE_NAME} || err_log "Failed to remove exited ${PACKAGE_NAME} container."
-    else
-        log "${PACKAGE_NAME} container is already active. Skipping creation."
-        return 0
-    fi
-fi
-
-
-    log "Creating the ${PACKAGE_NAME} container with mounts..."
-
-    # Parse mounts from the all_mounts file
-    MOUNT_FILE="${CONFIG_DIR}/all_mounts"
-    MOUNT_ARGS=$(parse_mounts "$MOUNT_FILE")
-    if [ $? -ne 0 ]; then
-        err_log "Failed to parse mounts from $MOUNT_FILE"
-        return 1
-    fi
-
-    # Create the container with parsed mounts and capture output
-    DOCKER_OUTPUT=$($DOCKER_PATH create --name jellyfin -p 8096:8096 -v "$CONFIG_DIR:/config" $MOUNT_ARGS jellyfin/jellyfin:10.8.10 2>&1)
-    DOCKER_EXIT_CODE=$?
-
-    if [ $DOCKER_EXIT_CODE -eq 0 ]; then
-        log "${PACKAGE_NAME} container created successfully."        
-    else
-        err_log "Failed to create ${PACKAGE_NAME} container. Docker output: $DOCKER_OUTPUT"
-        return 1
-    fi
-}
-
-create_all_mounts_file() {
-    log "Creating all_mounts file in the config directory "
-
-    # Detect primary volume and QPKG path
-    detect_primary_volume
-    resolve_qpkg_path
-
-    # Path to the smb.conf file and all_mounts file
-    SMB_CONF="/etc/config/smb.conf"
-    ALL_MOUNTS_FILE="${CONFIG_DIR}/all_mounts"
-
-    # Verify smb.conf existence
-    if [ ! -f "$SMB_CONF" ]; then
-        err_log "Shared folders configuration file not found: $SMB_CONF"
-        return 1
-    fi
-
-    # Ensure the config directory exists
-    if [ ! -d "$CONFIG_DIR" ]; then
-        mkdir -p "$CONFIG_DIR" || err_log "Failed to create config directory: $CONFIG_DIR"
-    fi
-
-    # Start fresh
-    > "$ALL_MOUNTS_FILE"
-
-    # Parse smb.conf for shared folder paths
-    grep "^\[" "$SMB_CONF" | sed 's/\[\(.*\)\]/\1/' | while read -r SHARE_NAME; do
-        SHARE_PATH=$(/sbin/getcfg "$SHARE_NAME" path -f "$SMB_CONF")
-        if [ -n "$SHARE_PATH" ] && [ -d "$SHARE_PATH" ]; then
-            if [ -w "$SHARE_PATH" ]; then
-		LOWERCASE_NAME=$(echo "$SHARE_NAME" | tr '[:upper:]' '[:lower:]')
-                CONTAINER_PATH="/mnt/${LOWERCASE_NAME}"  # Mount in lowercase now 
-                #CONTAINER_PATH="/mnt/${SHARE_NAME}"  # Mount under /mnt/<share_name> in the container
-                echo "-v ${SHARE_PATH}:${CONTAINER_PATH}:rw" >> "$ALL_MOUNTS_FILE"
-                log "Added mount: ${SHARE_PATH} -> ${CONTAINER_PATH} (RW access)"
-            else
-                warn_log "Skipping share without RW access: $SHARE_NAME ($SHARE_PATH)"
-            fi
-        else
-            warn_log "Skipping invalid or missing share: $SHARE_NAME ($SHARE_PATH)"
-        fi
-    done
-
-    log "All mounts written to: $ALL_MOUNTS_FILE"
-}
-
+# System functions - detect volume, QPKG directory path, package path and verify binary paths, etc.
 detect_primary_volume() {
     PRIMARY_VOLUME=$(getcfg SHARE_DEF defVolMP -d "" -f /etc/config/def_share.info)
     if [ -z "$PRIMARY_VOLUME" ]; then
         err_log "Primary volume not found. Exiting."
     fi
-    #log "Detected primary volume: $PRIMARY_VOLUME"
 }
 
 resolve_qpkg_path() {
@@ -152,13 +41,17 @@ resolve_qpkg_path() {
     fi
     QPKG_PATH="${QPKG_DIR}/${PACKAGE_NAME}"
     CONFIG_DIR="${QPKG_PATH}/config"
-    #log "Resolved QPKG path to: $QPKG_PATH"
 }
 
 verify_container_station() {
     if [ ! -d "${PRIMARY_VOLUME}/.qpkg/container-station" ]; then
         err_log "Container Station is not installed. Please install it first."
     fi
+}
+
+prepare_directories() {
+    mkdir -p "$QPKG_PATH" "$CONFIG_DIR" || err_log "Failed to create necessary directories at $QPKG_PATH or $CONFIG_DIR."
+    log "Directories prepared successfully."
 }
 
 detect_docker_binary() {
@@ -168,27 +61,96 @@ detect_docker_binary() {
         err_log "Docker binary not found or is not executable. Ensure Container Station is installed and accessible."
     fi
     export PATH="$(dirname "$DOCKER_PATH"):$PATH"
-    #log "Docker binary detected and PATH updated: $PATH"
 }
 
-prepare_directories() {
-    mkdir -p "$QPKG_PATH" "$CONFIG_DIR" || err_log "Failed to create necessary directories at $QPKG_PATH or $CONFIG_DIR."
-    log "Directories prepared successfully."
+detect_docker_compose() {
+    detect_docker_binary
+    if ! "$DOCKER_PATH" compose version >/dev/null 2>&1; then
+        err_log "docker compose not found or not working. Ensure Docker Compose plugin is installed."
+    fi
 }
 
-# Core functions
-pkg_pre_install() {
-    log "Running pre-installation steps..."
+# Read from smb and create a mount file with all the volume mapping
+create_all_mounts_file() {
+    log "Creating all_mounts file in the config directory"
+    detect_primary_volume
+    resolve_qpkg_path
+    SMB_CONF="/etc/config/smb.conf"
+    ALL_MOUNTS_FILE="${CONFIG_DIR}/all_mounts"
+    if [ ! -f "$SMB_CONF" ]; then
+        err_log "Shared folders configuration file not found: $SMB_CONF"
+        return 1
+    fi
+    if [ ! -d "$CONFIG_DIR" ]; then
+        mkdir -p "$CONFIG_DIR" || err_log "Failed to create config directory: $CONFIG_DIR"
+    fi
+    # Start fresh by emptying the file
+    > "$ALL_MOUNTS_FILE"
+    grep "^\[" "$SMB_CONF" | sed 's/\[\(.*\)\]/\1/' | while read -r SHARE_NAME; do
+        SHARE_PATH=$(/sbin/getcfg "$SHARE_NAME" path -f "$SMB_CONF")
+        if [ -n "$SHARE_PATH" ] && [ -d "$SHARE_PATH" ]; then
+            if [ -w "$SHARE_PATH" ]; then
+                CONTAINER_PATH="/mnt/${SHARE_NAME}"
+                echo "-v ${SHARE_PATH}:${CONTAINER_PATH}:rw" >> "$ALL_MOUNTS_FILE"
+            else
+                warn_log "Skipping share without RW access: $SHARE_NAME ($SHARE_PATH)"
+            fi
+        else
+            warn_log "Skipping invalid or missing share: $SHARE_NAME ($SHARE_PATH)"
+        fi
+    done
 }
 
+# YAML file generation with volumes from mount file
+create_docker_compose_file() {
+    create_all_mounts_file
+    COMPOSE_FILE="${QPKG_PATH}/docker-compose.yml"
+    cat > "$COMPOSE_FILE" <<EOF
+version: "10.8.10"
+services:
+  ${PACKAGE_NAME}:
+    image: ${DOCKER_IMAGE}
+    container_name: ${PACKAGE_NAME}
+    ports:
+      - "8096:8096"      
+    volumes:
+      - "${CONFIG_DIR}:/config"
+EOF
+    # Append additional volume mounts discovered from smb.conf
+    MOUNT_FILE="${CONFIG_DIR}/all_mounts"
+    if [ -f "$MOUNT_FILE" ]; then
+        while IFS= read -r LINE; do
+            if [[ $LINE == -v* ]]; then
+                # Remove leading "-v " and any quotes
+                MOUNT_ENTRY=$(echo "$LINE" | sed 's/^-v //;s/"//g')
+                echo "      - \"$MOUNT_ENTRY\"" >> "$COMPOSE_FILE"
+            fi
+        done < "$MOUNT_FILE"
+    fi
+    log "Docker Compose file created at: $COMPOSE_FILE"
+}
+
+create_container() {
+    log "Creating/Starting the ${PACKAGE_NAME} container using docker compose..."
+    create_docker_compose_file
+    DC_FILE="${QPKG_PATH}/docker-compose.yml"
+    "$DOCKER_PATH" compose -f "$DC_FILE" up -d
+    if [ $? -eq 0 ]; then
+        log "${PACKAGE_NAME} container created and started successfully via docker compose."
+    else
+        err_log "Failed to create/start ${PACKAGE_NAME} container using docker compose."
+        return 1
+    fi
+}
+
+# Package functions for install, remove, etc.
 pkg_install() {
     log "Starting ${PACKAGE_NAME} installation..."
     detect_primary_volume
     resolve_qpkg_path
     verify_container_station
-    detect_docker_binary
+    detect_docker_compose
     prepare_directories
-
     # Copy package_routines
     local PACKAGE_ROUTINES_SRC="$(dirname "$0")/package_routines"
     if [ ! -f "$PACKAGE_ROUTINES_SRC" ]; then
@@ -196,110 +158,90 @@ pkg_install() {
     fi
     cp "$PACKAGE_ROUTINES_SRC" "$QPKG_PATH" || err_log "Failed to copy package_routines to $QPKG_PATH."
     log "package_routines copied successfully."
-
-    # Pull Docker image
+    # Pull the Docker image (docker compose up will pull if needed; we do it explicitly here)
     log "Pulling ${PACKAGE_NAME} Docker image from Docker Hub..."
-    if ! $DOCKER_PATH pull ${DOCKER_IMAGE}; then	
-        err_log "Failed to pull ${PACKAGE_NAME} Docker image."
-    fi
+    "$DOCKER_PATH" pull ${DOCKER_IMAGE} || err_log "Failed to pull ${PACKAGE_NAME} Docker image."
     log "Docker image pulled successfully."
-
-    # Create or reuse the container
+    # Create (and start) the container using docker compose
     create_container
-
-    # Verify and start the container
     log "Verifying container creation..."
     pkg_start
-	
-}
-
-
-pkg_start() {
-    log "Starting ${PACKAGE_NAME}..."
-    detect_docker_binary
-    prepare_mounts
-
-    # Exact name match for ${PACKAGE_NAME} container
-    if $DOCKER_PATH inspect --type container ${PACKAGE_NAME} >/dev/null 2>&1; then
-        $DOCKER_PATH start ${PACKAGE_NAME} || err_log "Failed to start ${PACKAGE_NAME} container."
-        log "${PACKAGE_NAME} container started successfully."
-    else
-        err_log "${PACKAGE_NAME} container not found. Please install it first."
-    fi
-	
-	
 }
 
 pkg_post_install() {
     log "Running post-installation steps for ${PACKAGE_NAME}..."
-	resolve_qpkg_path
+    resolve_qpkg_path
     /sbin/setcfg "$QPKG_NAME" depend_on "container-station" -f /etc/config/qpkg.conf
     /sbin/setcfg "$QPKG_NAME" Timeout "120,60" -f /etc/config/qpkg.conf
     /sbin/setcfg "$QPKG_NAME" Enable TRUE -f /etc/config/qpkg.conf
-	
-
     log "Post-installation steps completed successfully."
 }
 
-pkg_stop() {
-    log "Stopping ${PACKAGE_NAME}..."
-    detect_docker_binary
-    if $DOCKER_PATH ps --filter "name=${PACKAGE_NAME}" | grep -q ${PACKAGE_NAME}; then
-        $DOCKER_PATH stop ${PACKAGE_NAME} || err_log "Failed to stop ${PACKAGE_NAME} container."
+pkg_start() {
+    log "Starting ${PACKAGE_NAME} container using docker compose..."
+    detect_primary_volume
+    resolve_qpkg_path
+    detect_docker_compose
+    DC_FILE="${QPKG_PATH}/docker-compose.yml"
+    "$DOCKER_PATH" compose -f "$DC_FILE" up -d
+    # Check if the container is running by filtering for running services.
+    RUNNING_SERVICE=$("$DOCKER_PATH" compose -f "$DC_FILE" ps --services --filter "status=running" | grep -w "${PACKAGE_NAME}")
+    if [ -n "$RUNNING_SERVICE" ]; then
+        log "${PACKAGE_NAME} container started successfully."
     else
-        warn_log "${PACKAGE_NAME} container not running."
+        err_log "Failed to start ${PACKAGE_NAME} container using docker compose."
     fi
-    log "${PACKAGE_NAME} container stopped successfully."
 }
 
-# Dynamically resolve QPKG path and Docker binary
-PKG_MAIN_REMOVE="{
-    QPKG_PATH=\$(/sbin/getcfg ${PACKAGE_NAME} Install_Path -d '' -f /etc/config/qpkg.conf)
-    DOCKER_PATH=\$(/sbin/getcfg container-station Install_Path -d '' -f /etc/config/qpkg.conf)/bin/docker
-
-    if [ -z \"\$QPKG_PATH\" ]; then
-        echo '[ERROR] Failed to resolve QPKG_PATH. Exiting.' >&2
-        exit 1
+pkg_stop() {
+    log "Stopping ${PACKAGE_NAME} container using docker compose..."
+    detect_docker_compose
+    detect_primary_volume
+    resolve_qpkg_path
+    DC_FILE="${QPKG_PATH}/docker-compose.yml"
+    "$DOCKER_PATH" compose -f "$DC_FILE" stop
+    # Check if the container is no longer running.
+    RUNNING_SERVICE=$("$DOCKER_PATH" compose -f "$DC_FILE" ps --services --filter "status=running" | grep -w "${PACKAGE_NAME}")
+    if [ -z "$RUNNING_SERVICE" ]; then
+        log "${PACKAGE_NAME} container stopped successfully."
+    else
+        err_log "Failed to stop ${PACKAGE_NAME} container using docker compose."
     fi
-    if [ -z \"\$DOCKER_PATH\" ] || [ ! -x \"\$DOCKER_PATH\" ]; then
-        echo '[ERROR] Docker binary not found or not executable. Exiting.' >&2
-        exit 1
-    fi
+}
 
-    echo '[INFO] Stopping ${PACKAGE_NAME} container...'
-    \$DOCKER_PATH stop ${PACKAGE_NAME} || echo '[WARN] Failed to stop ${PACKAGE_NAME} container.'
-
-    echo '[INFO] Removing ${PACKAGE_NAME} container...'
-    \$DOCKER_PATH rm -f ${PACKAGE_NAME} || echo '[WARN] Failed to remove ${PACKAGE_NAME} container.'
-
-    echo '[INFO] Removing QPKG directory at \$QPKG_PATH...'
-    rm -rf \$QPKG_PATH || echo '[WARN] Failed to remove QPKG directory.'
-
-    echo '[INFO] ${PACKAGE_NAME} QPKG removed successfully.'
-}"
-
-PKG_POST_REMOVE="{
-    echo '[INFO] Performing post-removal cleanup...'
-    # Add additional cleanup tasks here if necessary
-    echo '[INFO] Post-removal cleanup completed.'
-}"
-
+# We only give a pre_remove and let QNAP handle the uninstall itself.
+# We do the docker compose down without rmi; QNAP will handle the rest.
 PKG_PRE_REMOVE="{
-    QPKG_PATH=\$(/sbin/getcfg ${PACKAGE_NAME} Install_Path -d '' -f /etc/config/qpkg.conf)
-    DOCKER_PATH=\$(/sbin/getcfg container-station Install_Path -d '' -f /etc/config/qpkg.conf)/bin/docker
-
-    if [ -z \"\$DOCKER_PATH\" ] || [ ! -x \"\$DOCKER_PATH\" ]; then
-        echo '[ERROR] Docker binary not found. Exiting.' >&2
+    PACKAGE_NAME="${PACKAGE_NAME:-jellyfin}"
+    /sbin/log_tool -t0 -uSystem -p127.0.0.1 -mlocalhost -a '[INFO] PKG_PRE_REMOVE: Beginning removal process...'
+    # Reinitialize necessary variables inline.
+    CONTAINER_STATION_DIR=\$(/sbin/getcfg container-station Install_Path -f /etc/config/qpkg.conf)
+    DOCKER_PATH=\"\${CONTAINER_STATION_DIR}/bin/docker\"
+    /sbin/log_tool -t0 -uSystem -p127.0.0.1 -mlocalhost -a \"[INFO] Docker binary path: \$DOCKER_PATH\"
+    PRIMARY_VOLUME=\$(getcfg SHARE_DEF defVolMP -d '' -f /etc/config/def_share.info)
+    if [ -z \"\$PRIMARY_VOLUME\" ]; then
+        /sbin/log_tool -t2 -uSystem -p127.0.0.1 -mlocalhost -a '[ERROR] Primary volume not found. Exiting.'
         exit 1
     fi
-    echo '[INFO] Stopping ${PACKAGE_NAME} container before removal...'
-    \$DOCKER_PATH stop ${PACKAGE_NAME} || echo '[WARN] Container already stopped or not running.'
+    QPKG_DIR=\"\${PRIMARY_VOLUME}/.qpkg/\${PACKAGE_NAME}\"
+    CONFIG_DIR=\"\${QPKG_DIR}/config\"
+    QPKG_PATH=\"\$QPKG_DIR\"
+    DC_FILE=\"\$QPKG_PATH/docker-compose.yml\"
+    /sbin/log_tool -t0 -uSystem -p127.0.0.1 -mlocalhost -a \"[INFO] Docker Compose YAML file path: \$DC_FILE\"
+    # Change to the QPKG directory.
+    cd \"\$QPKG_PATH\" || exit 1
+    /sbin/log_tool -t0 -uSystem -p127.0.0.1 -mlocalhost -a '[INFO] Attempting to bring down the container using docker compose down...]'
+    # Run docker compose down, capture output and exit code.
+    OUTPUT=\$(\"\$DOCKER_PATH\" compose -f \"\$DC_FILE\" down 2>&1)
+    EXIT_CODE=\$?
+    /sbin/log_tool -t0 -uSystem -p127.0.0.1 -mlocalhost -a \"[INFO] docker compose down exited with code \$EXIT_CODE. Output: \$OUTPUT\"
+    if [ \$EXIT_CODE -ne 0 ]; then
+        /sbin/log_tool -t1 -uSystem -p127.0.0.1 -mlocalhost -a '[WARN] docker compose down failed.'
+    fi
 }"
 
-
-# Main entry point
+# Main Entry Point
 if [ -z "$1" ]; then
-    log "No argument provided. 'this could be a problem but we dont care'."
     set -- no_op
 fi
 
@@ -307,6 +249,6 @@ case "$1" in
     install) pkg_install ;;
     start) pkg_start ;;
     stop) pkg_stop ;;
-    no_op) no_op ;;  
-    *) err_log "Invalid action: $1. Use install, start, stop, or no_op." ;;
+    no_op) no_op ;;
+    *) err_log "Invalid action: $1. Use install, start, stop, remove, or no_op." ;;
 esac
