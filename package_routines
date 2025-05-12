@@ -2,7 +2,7 @@
 
 # Default variables (can be overridden)
 PACKAGE_NAME="${PACKAGE_NAME:-jellyfin}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-jellyfin/jellyfin:10.8.10}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-jellyfin/jellyfin}"
 
 # Unified logging functions
 log() {
